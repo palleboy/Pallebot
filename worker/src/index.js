@@ -125,6 +125,10 @@ export async function processMessage(db, request, now = new Date(), env) {
     return confirmReceipt(db, request, session, normalized, text, now);
   }
 
+  if (session?.state === "confirming_bulk_delete") {
+    return confirmBulkDelete(db, request.userId, session, normalized);
+  }
+
   if (isCancellation(normalized)) {
     return "Der er ingen igangværende handling at annullere.";
   }
@@ -174,6 +178,11 @@ export async function processMessage(db, request, now = new Date(), env) {
 
   if (normalized.startsWith("eksporter kvitteringsoversigt") || normalized.startsWith("eksporter budget")) {
     return exportReceiptExcel(db, request, text, now, env);
+  }
+
+  const deleteAll = allDeleteRequest(normalized);
+  if (deleteAll) {
+    return beginBulkDelete(db, request.userId, deleteAll, now);
   }
 
   const deleteNotes = numberedCommands(normalized, ["slet note", "fjern note"]);
@@ -604,6 +613,65 @@ async function deleteByPositions(db, table, userId, positions, itemName, activeO
   if (!found.length) return `❌ Jeg kunne ikke finde de valgte ${itemName}r.`;
   await db.batch(found.map((item) => db.prepare(`DELETE FROM ${table} WHERE id = ?`).bind(item.id)));
   return `🗑️ ${found.length} ${found.length === 1 ? itemName : `${itemName}r`} blev slettet.`;
+}
+
+export function allDeleteRequest(text) {
+  const requests = [
+    {
+      phrases: ["slet alle mine noter", "fjern alle mine noter", "slet alle noter", "fjern alle noter", "ryd mine noter", "ryd noter"],
+      table: "notes",
+      singular: "note",
+      plural: "noter",
+    },
+    {
+      phrases: ["slet alle mine varer på indkøbslisten", "fjern alle mine varer på indkøbslisten", "slet alle varer på indkøbslisten", "fjern alle varer på indkøbslisten", "slet min indkøbsliste", "ryd min indkøbsliste", "tøm indkøbslisten"],
+      table: "shopping_items",
+      singular: "vare",
+      plural: "varer på indkøbslisten",
+    },
+    {
+      phrases: ["slet alle mine påmindelser", "fjern alle mine påmindelser", "slet alle påmindelser", "fjern alle påmindelser", "ryd mine påmindelser"],
+      table: "reminders",
+      singular: "påmindelse",
+      plural: "aktive påmindelser",
+      activeOnly: true,
+    },
+  ];
+  return requests.find((request) => request.phrases.includes(text)) ?? null;
+}
+
+async function beginBulkDelete(db, userId, request, now) {
+  const activeFilter = request.activeOnly ? " AND done = 0" : "";
+  const row = await db.prepare(`SELECT COUNT(*) AS count FROM ${request.table} WHERE user_id = ?${activeFilter}`)
+    .bind(userId).first();
+  const count = Number(row?.count ?? 0);
+  if (!count) return `📭 Du har ingen ${request.plural} at slette.`;
+
+  await saveSession(db, userId, "confirming_bulk_delete", request, now);
+  return [
+    `⚠️ Du er ved at slette ${count} ${count === 1 ? request.singular : request.plural}.`,
+    "",
+    "Skriv ja for at bekræfte eller annuller for at beholde dem.",
+  ].join("\n");
+}
+
+async function confirmBulkDelete(db, userId, session, text) {
+  if (isCancellation(text)) {
+    await clearSession(db, userId);
+    return "✅ Sletningen blev annulleret.";
+  }
+  if (!matches(text, ["ja", "bekræft"])) {
+    return "⚠️ Skriv ja for at slette alt eller annuller for at beholde det.";
+  }
+
+  const activeFilter = session.data.activeOnly ? " AND done = 0" : "";
+  const row = await db.prepare(`SELECT COUNT(*) AS count FROM ${session.data.table} WHERE user_id = ?${activeFilter}`)
+    .bind(userId).first();
+  const count = Number(row?.count ?? 0);
+  if (count) await db.prepare(`DELETE FROM ${session.data.table} WHERE user_id = ?${activeFilter}`).bind(userId).run();
+  await clearSession(db, userId);
+  if (!count) return `📭 Der var ingen ${session.data.plural} tilbage at slette.`;
+  return `🗑️ ${count} ${count === 1 ? session.data.singular : session.data.plural} blev slettet.`;
 }
 
 async function itemAtPosition(db, table, userId, position, activeOnly) {

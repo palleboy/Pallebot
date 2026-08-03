@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { applyReceiptCorrection, canonicalItemName } from "../src/index.js";
+import { allDeleteRequest, applyReceiptCorrection, canonicalItemName } from "../src/index.js";
 
 test("samler sikre stavemåder af tun", () => {
   assert.equal(canonicalItemName("TUN"), "Tun");
@@ -29,4 +29,11 @@ test("kan fjerne en fejllæst varelinje før gemning", () => {
   assert.equal(result.removed, true);
   assert.equal(items.length, 1);
   assert.equal(items[0].name, "Mælk");
+});
+
+test("genkender naturlige slet-alt-kommandoer", () => {
+  assert.equal(allDeleteRequest("slet alle mine noter")?.table, "notes");
+  assert.equal(allDeleteRequest("slet alle mine varer på indkøbslisten")?.table, "shopping_items");
+  assert.equal(allDeleteRequest("ryd mine påmindelser")?.activeOnly, true);
+  assert.equal(allDeleteRequest("slet note 1"), null);
 });
