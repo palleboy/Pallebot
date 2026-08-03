@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS receipt_items (
     name TEXT NOT NULL,
     normalized_name TEXT NOT NULL,
     category TEXT NOT NULL,
+    quantity REAL NOT NULL DEFAULT 1,
+    unit_price REAL NOT NULL DEFAULT 0,
     line_total REAL NOT NULL
 );
 

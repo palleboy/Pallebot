@@ -12,6 +12,8 @@ const HELP_TEXT = [
   "• Husk mig på at købe mælk",
   "• Send et billede af en kvittering",
   "• Kvitteringsoversigt marts",
+  "• Vis mit indkøb af tun",
+  "• Vis kvitteringer fra Netto",
   "• Annuller",
 ].join("\n");
 
@@ -132,7 +134,7 @@ export async function processMessage(db, request, now = new Date(), env) {
   }
 
   if (normalized === "⏰ påmindelser") return "⏰ Skriv fx: Husk mig på at købe mælk.\n\nDu kan også skrive: Vis mine påmindelser eller Slet påmindelse 1.";
-  if (normalized === "🧾 kvitteringer") return "🧾 Send et billede af en kvittering. Jeg viser varelinjerne først, og du kan skrive ja for at gemme dem.";
+  if (normalized === "🧾 kvitteringer") return "🧾 Send et billede af en kvittering. Jeg viser varelinjerne først, og du kan skrive ja for at gemme dem. Prøv også: Vis mit indkøb af tun eller Vis kvitteringer fra Netto.";
   if (normalized === "💰 budget") return "💰 Skriv fx: Sæt budget mad 2500\n\nSkriv budgetstatus for at se dit forbrug.";
   if (normalized === "📎 excel-eksport") return "📎 Skriv: Eksporter kvitteringsoversigt\n\nEller: Eksporter kvitteringsoversigt marts";
 
@@ -150,7 +152,11 @@ export async function processMessage(db, request, now = new Date(), env) {
 
   if (normalized === "budgetstatus") return budgetStatus(db, request.userId, now);
 
-  if (normalized.startsWith("kvitteringsoversigt") || normalized.startsWith("budget") || normalized.startsWith("vis kvitteringer")) {
+  if (isReceiptSearch(normalized)) {
+    return receiptSearch(db, request.userId, text, now);
+  }
+
+  if (normalized.startsWith("kvitteringsoversigt") || normalized.startsWith("budget") || normalized === "vis kvitteringer") {
     return receiptSummary(db, request.userId, text, now);
   }
 
@@ -255,7 +261,7 @@ async function saveReceiptFromTelegram(env, message, now) {
     const analysis = await env.AI.run("@cf/meta/llama-3.2-11b-vision-instruct", {
       messages: [{
         role: "user",
-        content: `Læs denne danske butikskvittering. Returnér KUN JSON: {"store":"navn eller tom", "date":"YYYY-MM-DD eller tom", "items":[{"name":"kort, almindeligt varenavn", "category":"Mad|Snacks|Drikke|Grill|Husholdning|Andet", "line_total":12.50}]}. Medtag kun købte varer. line_total er hele beløbet for linjen, inklusiv antal. Normalisér samme produkt konsekvent, men hold forskellige varianter adskilt.`,
+        content: `Læs denne danske butikskvittering. Returnér KUN JSON: {"store":"navn eller tom", "date":"YYYY-MM-DD eller tom", "items":[{"name":"kort, almindeligt varenavn", "category":"Mad|Snacks|Drikke|Grill|Husholdning|Andet", "quantity":2, "unit_price":10.00, "line_total":20.00}]}. Medtag kun købte varer. quantity er antal, unit_price er pris pr. stk. og line_total er hele beløbet for linjen. Hvis antal eller stykspris ikke fremgår sikkert, brug quantity 1 og sæt unit_price lig line_total. Normalisér samme produkt konsekvent, men hold forskellige varianter adskilt.`,
       }],
       image,
       max_tokens: 900,
@@ -263,11 +269,14 @@ async function saveReceiptFromTelegram(env, message, now) {
     const receipt = parseAiJson(analysis.response ?? analysis.result ?? analysis);
     const items = Array.isArray(receipt.items) ? receipt.items
       .map((item) => ({
-        name: String(item.name ?? "").trim(),
+        name: canonicalItemName(String(item.name ?? "").trim()),
         category: RECEIPT_CATEGORIES.includes(item.category) ? item.category : "Andet",
+        quantity: validQuantity(item.quantity),
+        unitPrice: Number(item.unit_price),
         lineTotal: Number(item.line_total),
       }))
-      .filter((item) => item.name && Number.isFinite(item.lineTotal) && item.lineTotal >= 0) : [];
+      .map((item) => normaliseReceiptItemPrices(item))
+      .filter((item) => item.name && Number.isFinite(item.quantity) && Number.isFinite(item.unitPrice) && Number.isFinite(item.lineTotal) && item.lineTotal >= 0) : [];
     if (!items.length) return "❌ Jeg kunne ikke læse varelinjerne. Send gerne et skarpere foto af hele kvitteringen.";
 
     const date = /^\d{4}-\d{2}-\d{2}$/.test(receipt.date ?? "") ? receipt.date : copenhagenDate(now);
@@ -275,10 +284,10 @@ async function saveReceiptFromTelegram(env, message, now) {
     const total = items.reduce((sum, item) => sum + item.lineTotal, 0);
     return [
       `🧾 Kvittering fundet${receipt.store ? ` fra ${receipt.store}` : ""}.`,
-      ...items.map((item) => `• ${item.name}: ${formatMoney(item.lineTotal)}`),
+      ...items.map((item, index) => formatReceiptItem(item, index)),
       "",
       `I alt: ${formatMoney(total)}`,
-      "Skriv “ja” for at gemme, “ret 2 til 18” for at ændre en pris eller “annuller”.",
+      "Skriv “ja” for at gemme. Du kan skrive “ret 2 til 3 x 20”, “ret 2 pris 18”, “ret 2 antal 3”, “fjern 2” eller “annuller”.",
     ].join("\n");
   } catch (error) {
     console.error("Receipt analysis failed", error);
@@ -302,20 +311,79 @@ async function confirmReceipt(db, request, session, normalized, text, now) {
     const total = data.items.reduce((sum, item) => sum + item.lineTotal, 0);
     const created = await db.prepare("INSERT INTO receipts (user_id, chat_id, store, receipt_date, total, created_at) VALUES (?, ?, ?, ?, ?, ?)")
       .bind(request.userId, request.chatId, data.store, data.date, total, now.toISOString()).run();
-    await db.batch(data.items.map((item) => db.prepare("INSERT INTO receipt_items (receipt_id, user_id, name, normalized_name, category, line_total) VALUES (?, ?, ?, ?, ?, ?)")
-      .bind(created.meta.last_row_id, request.userId, item.name, normalizeItemName(item.name), item.category, item.lineTotal)));
+    await db.batch(data.items.map((item) => db.prepare("INSERT INTO receipt_items (receipt_id, user_id, name, normalized_name, category, quantity, unit_price, line_total) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .bind(created.meta.last_row_id, request.userId, item.name, normalizeItemName(canonicalItemName(item.name)), item.category, item.quantity, item.unitPrice, item.lineTotal)));
     await clearSession(db, request.userId);
     return `✅ Kvittering gemt. I alt: ${formatMoney(total)}.`;
   }
-  const correction = text.match(/^ret\s+(\d+)\s+til\s+(\d+(?:[,.]\d+)?)\s*(?:kr)?$/iu);
-  if (correction) {
-    const item = session.data.items[Number(correction[1]) - 1];
-    if (!item) return "❌ Jeg kunne ikke finde den varelinje.";
-    item.lineTotal = Number(correction[2].replace(",", "."));
+  const change = applyReceiptCorrection(session.data.items, text);
+  if (change) {
+    if (change.error) return change.error;
     await saveSession(db, request.userId, "confirming_receipt", session.data, now);
-    return `✅ ${item.name} er rettet til ${formatMoney(item.lineTotal)}. Skriv “ja” for at gemme.`;
+    if (change.removed) {
+      return [`${change.message}`, "", ...session.data.items.map((item, index) => formatReceiptItem(item, index)), "", "Skriv “ja” for at gemme."].join("\n");
+    }
+    return `✅ ${change.message}\n${formatReceiptItem(change.item, change.index)}\n\nSkriv “ja” for at gemme.`;
   }
-  return "Skriv “ja” for at gemme, “ret 2 til 18” eller “annuller”.";
+  return "Skriv “ja” for at gemme, “ret 2 til 3 x 20”, “ret 2 pris 18”, “ret 2 antal 3”, “fjern 2” eller “annuller”.";
+}
+
+function validQuantity(value) {
+  const quantity = Number(value);
+  return Number.isFinite(quantity) && quantity > 0 ? quantity : 1;
+}
+
+function normaliseReceiptItemPrices(item) {
+  const lineTotal = Number.isFinite(item.lineTotal) ? item.lineTotal : item.quantity * item.unitPrice;
+  const unitPrice = Number.isFinite(item.unitPrice) && item.unitPrice >= 0 ? item.unitPrice : lineTotal / item.quantity;
+  return { ...item, lineTotal, unitPrice };
+}
+
+function formatReceiptItem(item, index) {
+  const prefix = index === undefined ? "•" : `${index + 1}.`;
+  const quantity = Number(item.quantity ?? 1);
+  if (quantity === 1) return `${prefix} ${item.name}: ${formatMoney(item.lineTotal)}`;
+  return `${prefix} ${quantity} x ${item.name} á ${formatMoney(item.unitPrice)} = ${formatMoney(item.lineTotal)}`;
+}
+
+export function applyReceiptCorrection(items, text) {
+  const remove = text.match(/^fjern(?:\s+vare)?\s+(\d+)$/iu);
+  if (remove) {
+    const index = Number(remove[1]) - 1;
+    const [item] = items.splice(index, 1);
+    if (!item) return { error: "❌ Jeg kunne ikke finde den varelinje." };
+    if (!items.length) return { error: "❌ Du kan ikke fjerne alle varelinjer. Skriv “annuller” for at kassere kvitteringen." };
+    return { removed: true, message: `✅ ${item.name} er fjernet.` };
+  }
+
+  const combined = text.match(/^ret\s+(\d+)\s+til\s+(\d+(?:[,.]\d+)?)\s*(?:x|×|stk\.?\s*(?:á|a|à))\s*(\d+(?:[,.]\d+)?)\s*(?:kr)?$/iu);
+  const price = text.match(/^ret\s+(\d+)\s+(?:pris|stkpris)\s+(\d+(?:[,.]\d+)?)\s*(?:kr)?$/iu);
+  const quantity = text.match(/^ret\s+(\d+)\s+antal\s+(\d+(?:[,.]\d+)?)$/iu);
+  const legacyTotal = text.match(/^ret\s+(\d+)\s+til\s+(\d+(?:[,.]\d+)?)\s*(?:kr)?$/iu);
+  const match = combined ?? price ?? quantity ?? legacyTotal;
+  if (!match) return null;
+
+  const index = Number(match[1]) - 1;
+  const item = items[index];
+  if (!item) return { error: "❌ Jeg kunne ikke finde den varelinje." };
+  if (combined) {
+    item.quantity = Number(combined[2].replace(",", "."));
+    item.unitPrice = Number(combined[3].replace(",", "."));
+    item.lineTotal = item.quantity * item.unitPrice;
+  } else if (price) {
+    item.unitPrice = Number(price[2].replace(",", "."));
+    item.lineTotal = item.quantity * item.unitPrice;
+  } else if (quantity) {
+    item.quantity = Number(quantity[2].replace(",", "."));
+    item.lineTotal = item.quantity * item.unitPrice;
+  } else {
+    item.lineTotal = Number(legacyTotal[2].replace(",", "."));
+    item.unitPrice = item.lineTotal / item.quantity;
+  }
+  if (!Number.isFinite(item.quantity) || item.quantity <= 0 || !Number.isFinite(item.unitPrice) || item.unitPrice < 0) {
+    return { error: "❌ Antal og pris skal være gyldige, positive tal." };
+  }
+  return { item, index, message: `✅ ${item.name} er rettet.` };
 }
 
 async function receiptSummary(db, userId, text, now) {
@@ -353,9 +421,67 @@ async function exportReceiptExcel(db, request, text, now, env) {
 
 async function receiptTotals(db, userId, month) {
   const { results } = await db.prepare(
-    "SELECT category, MIN(name) AS name, SUM(line_total) AS total FROM receipt_items ri JOIN receipts r ON r.id = ri.receipt_id WHERE ri.user_id = ? AND r.receipt_date >= ? AND r.receipt_date < ? GROUP BY category, normalized_name ORDER BY category, name",
+    "SELECT category, name, SUM(line_total) AS total FROM receipt_items ri JOIN receipts r ON r.id = ri.receipt_id WHERE ri.user_id = ? AND r.receipt_date >= ? AND r.receipt_date < ? GROUP BY category, normalized_name, name ORDER BY category, name",
   ).bind(userId, month.start, month.end).all();
-  return results;
+  const merged = new Map();
+  for (const item of results) {
+    const name = canonicalItemName(item.name);
+    const key = `${item.category}|${normalizeItemName(name)}`;
+    const existing = merged.get(key) ?? { category: item.category, name, total: 0 };
+    existing.total += Number(item.total);
+    merged.set(key, existing);
+  }
+  return [...merged.values()].sort((left, right) => left.category.localeCompare(right.category, "da") || left.name.localeCompare(right.name, "da"));
+}
+
+function isReceiptSearch(text) {
+  return text.startsWith("vis mit indkøb af ")
+    || text.startsWith("vis køb af ")
+    || text.startsWith("søg kvitteringer efter ")
+    || text.startsWith("vis kvitteringer fra ")
+    || text.startsWith("hvad brugte jeg på ")
+    || text.startsWith("hvad har jeg brugt på ");
+}
+
+function receiptSearchTerm(text, prefixes) {
+  const normalized = normalize(text);
+  const prefix = prefixes.find((candidate) => normalized.startsWith(candidate));
+  if (!prefix) return "";
+  return text.slice(prefix.length)
+    .replace(/\s+i\s+(januar|februar|marts|april|maj|juni|juli|august|september|oktober|november|december)(?:\s+20\d{2})?\s*$/iu, "")
+    .replace(/\s+i\s+20\d{2}\s*$/iu, "")
+    .trim();
+}
+
+async function receiptSearch(db, userId, text, now) {
+  const normalized = normalize(text);
+  const month = receiptMonth(text, now);
+  const store = receiptSearchTerm(text, ["vis kvitteringer fra "]);
+  if (store) {
+    const { results } = await db.prepare(
+      "SELECT receipt_date, store, total FROM receipts WHERE user_id = ? AND receipt_date >= ? AND receipt_date < ? AND LOWER(COALESCE(store, '')) LIKE ? ORDER BY receipt_date, id",
+    ).bind(userId, month.start, month.end, `%${store.toLocaleLowerCase("da-DK")}%`).all();
+    if (!results.length) return `🧾 Ingen kvitteringer fra ${store} i ${month.label}.`;
+    const total = results.reduce((sum, receipt) => sum + Number(receipt.total), 0);
+    return [`🧾 Kvitteringer fra ${store} — ${month.label}`, "", ...results.map((receipt) => `• ${receipt.receipt_date}: ${receipt.store || "Ukendt butik"} — ${formatMoney(receipt.total)}`), "", `TOTAL: ${formatMoney(total)}`].join("\n");
+  }
+
+  const category = RECEIPT_CATEGORIES.find((entry) => normalized.includes(entry.toLocaleLowerCase("da-DK")));
+  const askingForSpend = normalized.startsWith("hvad brugte jeg på ") || normalized.startsWith("hvad har jeg brugt på ");
+  if (category && askingForSpend) {
+    const items = (await receiptTotals(db, userId, month)).filter((item) => item.category === category);
+    if (!items.length) return `🧾 Ingen køb i kategorien ${category} i ${month.label}.`;
+    const total = items.reduce((sum, item) => sum + Number(item.total), 0);
+    return [`💰 ${category} — ${month.label}`, "", ...items.map((item) => `• ${item.name}: ${formatMoney(item.total)}`), "", `I alt: ${formatMoney(total)}`].join("\n");
+  }
+
+  const product = receiptSearchTerm(text, ["vis mit indkøb af ", "vis køb af ", "søg kvitteringer efter ", "hvad brugte jeg på ", "hvad har jeg brugt på "]);
+  if (!product) return "❌ Hvilken vare eller butik vil du søge efter?";
+  const searchName = normalizeItemName(canonicalItemName(product));
+  const items = (await receiptTotals(db, userId, month)).filter((item) => normalizeItemName(item.name).includes(searchName));
+  if (!items.length) return `🧾 Jeg fandt ingen køb af ${product} i ${month.label}.`;
+  const total = items.reduce((sum, item) => sum + Number(item.total), 0);
+  return [`🧾 Køb af ${canonicalItemName(product)} — ${month.label}`, "", ...items.map((item) => `• ${item.name}: ${formatMoney(item.total)}`), "", `I alt: ${formatMoney(total)}`].join("\n");
 }
 
 async function budgetStatus(db, userId, now) {
@@ -412,6 +538,17 @@ function toBase64(bytes) {
 
 function normalizeItemName(value) {
   return value.toLocaleLowerCase("da-DK").normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+const PRODUCT_ALIASES = new Map([
+  ["tun", "Tun"],
+  ["tunfisk", "Tun"],
+  ["tun fisk", "Tun"],
+]);
+
+export function canonicalItemName(value) {
+  const cleaned = String(value ?? "").replace(/\s+/g, " ").trim();
+  return PRODUCT_ALIASES.get(normalizeItemName(cleaned)) ?? cleaned;
 }
 
 function copenhagenDate(date) {
