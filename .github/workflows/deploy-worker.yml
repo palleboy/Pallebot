@@ -18,5 +18,5 @@ jobs:
       - uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          workingDirectory: worker
-          command: deploy
+          wranglerVersion: "4.118.0"
+          command: deploy --config worker/wrangler.jsonc
