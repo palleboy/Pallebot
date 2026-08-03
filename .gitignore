@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+.venv/
+
+# Environment
+.env
+
+# VS Code
+.vscode/
+
+# Logs
+logs/
+
+# Private runtime data
+data/*.json
+
+# Python cache
+.pytest_cache/
+
+# macOS
+.DS_Store

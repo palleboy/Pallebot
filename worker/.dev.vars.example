@@ -1,0 +1,3 @@
+TELEGRAM_BOT_TOKEN=indsæt_din_telegram_bot_token
+TELEGRAM_WEBHOOK_SECRET=brug_en_lang_tilfældig_streng
+OWNER_USER_ID=dit_telegram_bruger_id
